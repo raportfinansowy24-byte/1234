@@ -1,97 +1,132 @@
-import requests
+import time
 import logging
 import os
-from dotenv import load_dotenv
-from optimizer import get_optimizer
+import shutil
+import subprocess
+import random
+from gradio_client import Client
 
-load_dotenv()
-
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger(__name__)
 
-HF_API_TOKEN = os.getenv("HF_API_TOKEN")
-HEADERS = {"Authorization": f"Bearer {HF_API_TOKEN}"}
-API_URL = "https://api-inference.huggingface.co/models/stabilityai/stable-diffusion-xl-base-1.0"
+DEFAULT_NEGATIVE_PROMPT = (
+    "worst quality, inconsistent motion, blurry, jittery, distorted, "
+    "watermark, logo, duplicate, deformed hands, extra fingers, artifacts"
+)
 
-
-def generate_ai_content(prompt: str, filename: str) -> bool:
-    """Wysyła zapytanie do modelu wizualnego i zapisuje plik."""
-    logger.info(f"🔗 [API] Wysyłam zapytanie o obraz/wideo...")
-    payload = {"inputs": prompt}
+def _generate_single_scene(client: Client, prompt: str, duration: int, seed: int, output_path: str) -> bool:
+    max_retries = 10
+    wait_time_seconds = 600  
     
-    try:
-        response = requests.post(API_URL, headers=HEADERS, json=payload, timeout=45)
-        if response.status_code == 200:
-            with open(filename, 'wb') as f:
-                f.write(response.content)
-            logger.info(f"✨ Sukces! Pobrany plik: {filename}")
-            return True
-        else:
-            logger.error(f"❌ Błąd API: {response.status_code} - {response.text}")
-            return False
-    except Exception as e:
-        logger.error(f"💥 Błąd sieciowy: {e}")
-        return False
+    for attempt in range(max_retries):
+        try:
+            logger.info(f"Generowanie sceny -> {output_path} (Próba {attempt + 1}/{max_retries})...")
+            
+            # Nowa, zaktualizowana struktura zapytań dla API LTX-Video-ZeroGPU-Optimized
+            result = client.predict(
+                prompt=prompt,
+                negative_prompt=DEFAULT_NEGATIVE_PROMPT,
+                input_image_filepath=None,
+                input_video_filepath=None,
+                height_ui=1280,
+                width_ui=704,
+                mode="text-to-video",
+                duration_ui=duration,
+                ui_frames_to_use=9,
+                seed_ui=seed,
+                randomize_seed=False,
+                ui_guidance_scale=2,
+                improve_texture_flag=True,
+                slow_motion_flag=False,
+                api_name="/text_to_video"
+            )
+            
+            # API zwraca teraz tuplę: (slownik_z_wideo, seed)
+            if result and len(result) > 0:
+                video_data = result[0]
+                
+                # Wyciągnięcie ścieżki w zależności od tego, jak dokładnie Gradio ją pakuje
+                video_filepath = video_data.get('video') if isinstance(video_data, dict) else video_data
+                
+                if video_filepath and os.path.exists(video_filepath):
+                    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+                    shutil.copy(video_filepath, output_path)
+                    return True
+                else:
+                    logger.error(f"API zwróciło pustą lub nieprawidłową ścieżkę: {video_filepath}")
+            else:
+                logger.error("Brak odpowiedzi od API (pusty wynik).")
+                
+        except Exception as e:
+            error_msg = str(e).lower()
+            if any(err in error_msg for err in ["queue full", "gpu busy", "capacity", "rate limit", "time limit"]):
+                logger.warning(f"Serwer przeciążony. Odczekam 10 minut. Szczegóły: {e}")
+                time.sleep(wait_time_seconds)
+            else:
+                logger.error(f"Nieoczekiwany błąd API: {e}")
+                time.sleep(60)
+                
+    return False
 
-def build_story_prompt(topic: str, narration: dict) -> str:
-    """
-    Używa Gemini do zbudowania spójnego promptu wideo (18s) dla modelu LTX 2.3.
-    Wykorzystuje system cache, aby oszczędzać zapytania do API Gemini.
-    """
-    optimizer = get_optimizer()
+def generate_ai_video(prompts: list[str], output_cache_path: str = "cache/final_output.mp4") -> tuple[str, int]:
+    if not prompts:
+        logger.error("Otrzymano pustą listę promptów.")
+        return None, None
+
+    hf_token = os.environ.get("HF_TOKEN")
+    if not hf_token:
+        logger.warning("Brak HF_TOKEN w zmiennych środowiskowych. Wywołania ZeroGPU mogą być limitowane.")
+
+    client = Client("DeepRat/LTX-Video-ZeroGPU-Optimized", token=hf_token)
+    cache_dir = os.path.dirname(output_cache_path) or "cache"
+    os.makedirs(cache_dir, exist_ok=True)
     
-    # 1. Sprawdzamy, czy ten scenariusz już kiedyś wygenerowaliśmy (Oszczędność!)
-    cached_prompt = optimizer.get_cached_gemini_prompt(topic, narration)
-    if cached_prompt:
-        return cached_prompt
+    temp_files = []
+    master_seed = random.randint(0, 2147483647)
+    logger.info(f"Wygenerowano seed dla produkcji: {master_seed}")
+    
+    for i, prompt in enumerate(prompts):
+        scene_path = os.path.join(cache_dir, f"scene_{i+1}.mp4")
+        logger.info(f"--- Start generowania sceny {i+1}/{len(prompts)} ---")
+        
+        # LTX domyślnie generuje krótkie ujęcia, podajemy 6, ale API najpewniej przytnie to wg. swoich limitów.
+        success = _generate_single_scene(client, prompt, duration=6, seed=master_seed, output_path=scene_path)
+        
+        if not success:
+            logger.critical(f"Nie udało się wygenerować sceny {i+1}.")
+            return None, master_seed
+        
+        temp_files.append(scene_path)
 
-    # 2. Przygotowanie danych
-    hook_text = narration.get("hook", "")
-    problem_text = narration.get("problem", "")
-    solution_text = narration.get("rozwiązanie", "")
-
-    fallback_prompt = (
-        f"Cinematic 18-second financial story about {topic}. "
-        "A professional in a modern office environment: first looking stressed at financial documents, "
-        "then discovering a solution on a smartphone showing green growth charts, "
-        "finally smiling with relief. Consistent character, warm studio lighting, 4K, professional."
-    )
-
-    # 3. Jeśli nie ma Gemini, używamy fallback i również go zapisujemy w cache
-    if not GEMINI_CLIENT:
-        logger.warning("⚠️ GEMINI_CLIENT niedostępny – używam domyślnego (fallback) promptu.")
-        optimizer.cache_gemini_prompt(topic, narration, fallback_prompt)
-        return fallback_prompt
-
-    # 4. Właściwe zapytanie do Gemini (zostanie aktywowane, gdy dodasz klucz)
-    gemini_prompt = f"""You are a professional video director creating a single 18-second cinematic video for LTX 2.3 text-to-video model.
-
-Topic: {topic}
-Hook (0-6s): {hook_text}
-Problem (6-12s): {problem_text}
-Solution (12-18s): {solution_text}
-
-Create ONE cohesive LTX 2.3 video prompt that:
-1. Covers all three narrative phases in a single continuous shot or seamless transitions
-2. Maintains a consistent character, environment, and visual style throughout
-3. Uses professional, cinematic language suitable for a high-quality video model
-4. Includes specific visual details (lighting, camera movement, props, colors)
-5. Emphasizes the emotional arc: tension → discovery → resolution
-6. Is concise but vivid (150-250 words)
-
-Return ONLY the video prompt, no explanations or JSON."""
-
+    logger.info("Wszystkie sceny wygenerowane. Rozpoczynam łączenie wideo przez FFmpeg...")
+    concat_list_path = os.path.join(cache_dir, "concat_list.txt")
+    
+    with open(concat_list_path, "w") as f:
+        for temp_file in temp_files:
+            abs_path = os.path.abspath(temp_file)
+            f.write(f"file '{abs_path}'\n")
+            
     try:
-        # Symulacja wywołania Gemini (tutaj wpiszemy kod API Google)
-        # response = GEMINI_CLIENT.generate_content(gemini_prompt)
-        # generated_prompt = response.text.strip()
+        command = [
+            "ffmpeg", "-y", "-f", "concat", "-safe", "0",
+            "-i", concat_list_path,
+            "-c", "copy", output_cache_path
+        ]
+        subprocess.run(command, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        logger.info(f"Sukces! Plik zapisany w: {output_cache_path}")
         
-        # Na potrzeby testów, jeśli dojdziesz tutaj, zwróci po prostu przygotowany tekst
-        generated_prompt = "Symulowany tekst z Gemini" 
+    except subprocess.CalledProcessError as e:
+        logger.error(f"Błąd FFmpeg: {e}")
+        return None, master_seed
         
-        # 5. Zapisujemy wygenerowany scenariusz do cache
-        optimizer.cache_gemini_prompt(topic, narration, generated_prompt)
-        return generated_prompt
-        
-    except Exception as e:
-        logger.error(f"❌ Błąd podczas odpytywania Gemini: {e}")
-        return fallback_prompt
+    finally:
+        if os.path.exists(concat_list_path):
+            os.remove(concat_list_path)
+        for temp_file in temp_files:
+            if os.path.exists(temp_file):
+                os.remove(temp_file)
+                
+    return output_cache_path, master_seed
