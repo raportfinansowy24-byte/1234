@@ -1,0 +1,8 @@
+.env
+credentials.json
+venv/
+__pycache__/
+*.png
+*.mp4
+*.log
+.DS_Store
