@@ -31,8 +31,8 @@ def _generate_single_scene(client: Client, prompt: str, duration: int, seed: int
                 negative_prompt=DEFAULT_NEGATIVE_PROMPT,
                 input_image_filepath=None,
                 input_video_filepath=None,
-                height_ui=1280,
-                width_ui=704,
+                height_ui=704,
+                width_ui=512,
                 mode="text-to-video",
                 duration_ui=duration,
                 ui_frames_to_use=9,
@@ -85,21 +85,26 @@ def generate_ai_video(prompts: list[str], output_cache_path: str = "cache/final_
     os.makedirs(cache_dir, exist_ok=True)
     
     temp_files = []
-    master_seed = random.randint(0, 2147483647)
-    logger.info(f"Wygenerowano seed dla produkcji: {master_seed}")
+    # Usunięto master_seed na poziomie produkcji
+    logger.info("Rozpoczynanie generowania produkcji z unikalnymi seedami dla każdej sceny.")
     
     for i, prompt in enumerate(prompts):
         scene_path = os.path.join(cache_dir, f"scene_{i+1}.mp4")
         logger.info(f"--- Start generowania sceny {i+1}/{len(prompts)} ---")
         
-        # LTX domyślnie generuje krótkie ujęcia, podajemy 6, ale API najpewniej przytnie to wg. swoich limitów.
-        success = _generate_single_scene(client, prompt, duration=6, seed=master_seed, output_path=scene_path)
+        # Generowanie unikalnego ziarna dla każdej sceny
+        scene_seed = random.randint(0, 2147483647)
+        
+        # Zmieniono czas trwania na 2 sekundy na scenę, w celach diagnostycznych.
+        success = _generate_single_scene(client, prompt, duration=2, seed=scene_seed, output_path=scene_path)
         
         if not success:
             logger.critical(f"Nie udało się wygenerować sceny {i+1}.")
-            return None, master_seed
+            return None, scene_seed
         
         temp_files.append(scene_path)
+        time.sleep(30) # Oddech dla API przed kolejną sceną
+        # KONIEC WKLEJANEGO KODU
 
     logger.info("Wszystkie sceny wygenerowane. Rozpoczynam łączenie wideo przez FFmpeg...")
     concat_list_path = os.path.join(cache_dir, "concat_list.txt")
@@ -120,7 +125,7 @@ def generate_ai_video(prompts: list[str], output_cache_path: str = "cache/final_
         
     except subprocess.CalledProcessError as e:
         logger.error(f"Błąd FFmpeg: {e}")
-        return None, master_seed
+        return None, scene_seed
         
     finally:
         if os.path.exists(concat_list_path):
