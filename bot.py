@@ -1,11 +1,10 @@
 import time
 import shutil
 import logging
-import random
 import asyncio
-import threading
-from dotenv import load_dotenv
+import os
 from pathlib import Path
+from dotenv import load_dotenv
 from optimizer import get_optimizer
 from ai_models import generate_ai_video
 from sheets import connect_to_sheet
@@ -66,13 +65,108 @@ def build_story_prompts(base_prompt: str) -> list[str]:
     ]
 
 
+async def process_single_task(sheet, optimizer, i: int, row: dict, naglowki: list, indeks_status: int, indeks_seed: int) -> bool:
+    """
+    Process a single task asynchronously.
+    
+    Returns True if task was successfully processed, False otherwise.
+    """
+    try:
+        kolumna_status_nazwa = naglowki[indeks_status]
+        wartosc_status = str(row.get(kolumna_status_nazwa, "")).strip()
+
+        if wartosc_status != "Do zrobienia" and wartosc_status != "":
+            return False  # Skip non-pending tasks
+
+        task_id = row.get("id", f"task_{i}")
+        prompt_tekst = str(row.get("prompt", "")).strip()
+
+        if not prompt_tekst or prompt_tekst.startswith("http"):
+            logger.warning(f"⚠️ Pominięto zadanie ID: {task_id} (błędny lub pusty prompt)")
+            sheet.update_cell(i + 2, indeks_status + 1, "Błąd - Pusty lub URL")
+            return False
+
+        logger.info(f"\n🚀 Przetwarzanie ID: {task_id}")
+        output_path = STORAGE_DIR / f"video_{task_id}.mp4"
+
+        # 1. Check cache FIRST before generating
+        cached_video = optimizer.get_cached_video(
+            prompt=prompt_tekst, duration=4, height=512, width=512
+        )
+        if cached_video:
+            logger.info(f"✅ Użycie cache dla zadania {task_id}")
+            shutil.copy(cached_video, output_path)
+            sheet.update_cell(i + 2, indeks_status + 1, "Gotowe")
+            if indeks_seed is not None:
+                sheet.update_cell(i + 2, indeks_seed + 1, "cached")
+            return True
+
+        # 2. Build story structure (3 scenes)
+        sceny_prompts = build_story_prompts(prompt_tekst)
+        logger.info("✅ Wygenerowano strukturę storyboardu (3 sceny).")
+
+        # 3. Reserve task in sheet
+        sheet.update_cell(i + 2, indeks_status + 1, "Generowanie...")
+
+        # 4. Get HF token
+        hf_token = os.environ.get("HF_TOKEN")
+        if not hf_token:
+            logger.warning("⚠️ Brak HF_TOKEN w zmiennych środowiskowych!")
+            sheet.update_cell(i + 2, indeks_status + 1, "Błąd - Brak tokena")
+            return False
+
+        temp_cache_file = f"cache/temp_render_{task_id}.mp4"
+
+        # 5. Generate video asynchronously
+        try:
+            logger.info(f"🎬 Wysyłam zadanie {task_id} do ZeroGPU...")
+            final_video_cache, used_seed = await generate_ai_video(
+                sceny_prompts, output_cache_path=temp_cache_file
+            )
+
+            if final_video_cache and Path(final_video_cache).exists():
+                shutil.move(final_video_cache, output_path)
+                logger.info(f"✅ Sukces! Pełny materiał dla ID {task_id} zapisany w: {output_path}")
+
+                # Cache the video for future use
+                optimizer.cache_video(
+                    prompt=prompt_tekst, duration=4, height=512, width=512,
+                    video_url_or_path=str(output_path), ttl_hours=168
+                )
+
+                sheet.update_cell(i + 2, indeks_status + 1, "Gotowe")
+
+                if indeks_seed is not None and used_seed:
+                    sheet.update_cell(i + 2, indeks_seed + 1, str(used_seed))
+                    logger.info(f"💾 Seed {used_seed} zalogowany w arkuszu.")
+                
+                return True
+            else:
+                logger.error(f"❌ Generowanie wideo nie powiodło się dla zadania {task_id}")
+                sheet.update_cell(i + 2, indeks_status + 1, "Błąd - Generacja")
+                return False
+
+        except Exception as e:
+            logger.error(f"💥 Błąd podczas generowania wideo dla {task_id}: {e}")
+            sheet.update_cell(i + 2, indeks_status + 1, f"Błąd - {str(e)[:30]}")
+            return False
+
+    except Exception as e:
+        logger.error(f"💥 Nieoczekiwany błąd w process_single_task: {e}")
+        return False
+
+
 async def process_tasks_async(sheet, optimizer):
-    """Async task processor - non-blocking video generation."""
+    """
+    Async task processor - allows processing tasks efficiently.
+    """
     logger.info("🧐 Sprawdzam zadania w arkuszu...")
 
     # Occasional cache cleanup
     if int(time.time()) % 10 == 0:
         deleted = optimizer.cleanup_expired_cache()
+        if deleted > 0:
+            logger.info(f"🧹 Wyczyszczono {deleted} wygasłych wpisów cache")
 
     # Get headers ONCE (moved outside loop)
     naglowki = get_sheet_headers(sheet)
@@ -91,119 +185,36 @@ async def process_tasks_async(sheet, optimizer):
 
     data = sheet.get_all_records()
     if not data:
+        logger.info("📊 Brak zadań w arkuszu.")
         return
 
-    kolumna_status_nazwa = naglowki[indeks_status]
-
+    # Process tasks sequentially (safer for API limits, but can be made parallel if needed)
+    tasks_processed = 0
     for i, row in enumerate(data):
-        wartosc_status = str(row.get(kolumna_status_nazwa, "")).strip()
+        success = await process_single_task(sheet, optimizer, i, row, naglowki, indeks_status, indeks_seed)
+        if success:
+            tasks_processed += 1
 
-        if wartosc_status == "Do zrobienia" or wartosc_status == "":
-            task_id = row.get("id", f"task_{i}")
-            prompt_tekst = str(row.get("prompt", "")).strip()
-
-            if not prompt_tekst or prompt_tekst.startswith("http"):
-                logger.warning(
-                    f"⚠️ Pominięto zadanie ID: {task_id} (błędny lub pusty prompt)"
-                )
-                sheet.update_cell(i + 2, indeks_status + 1, "Błąd - Pusty lub URL")
-                continue
-
-            logger.info(f"\n🚀 Przetwarzanie ID: {task_id}")
-            output_path = STORAGE_DIR / f"video_{task_id}.mp4"
-
-            # 1. Check cache FIRST before generating
-            cached_video = optimizer.get_cached_video(
-                prompt=prompt_tekst, duration=2, height=704, width=512
-            )
-            if cached_video:
-                logger.info(f"✅ Using cached video for task {task_id}")
-                shutil.copy(cached_video, output_path)
-                sheet.update_cell(i + 2, indeks_status + 1, "Gotowe")
-                continue
-
-            # 2. Build story structure (3 scenes)
-            sceny_prompts = build_story_prompts(prompt_tekst)
-            logger.info("✅ Wygenerowano strukturę storyboardu (3 sceny).")
-
-            # 3. Reserve task in sheet
-            sheet.update_cell(i + 2, indeks_status + 1, "Generowanie...")
-
-            # 4. Get HF tokens with fallback
-            import os
-            lista_kluczy = [
-                os.environ.get("HF_TOKEN_1"),
-                os.environ.get("HF_TOKEN_2"),
-                os.environ.get("HF_TOKEN_3"),
-            ]
-            lista_kluczy = [k.strip() for k in lista_kluczy if k and k.strip()]
-
-            if not lista_kluczy and os.environ.get("HF_TOKEN"):
-                lista_kluczy = [os.environ.get("HF_TOKEN").strip()]
-
-            final_video_cache = None
-            used_seed = None
-            temp_cache_file = f"cache/temp_render_{task_id}.mp4"
-
-            if not lista_kluczy:
-                logger.warning("⚠️ Brak jakichkolwiek kluczy HF_TOKEN w zmiennych środowiskowych. Próba bez klucza...")
-                try:
-                    final_video_cache, used_seed = await generate_ai_video(
-                        sceny_prompts, output_cache_path=temp_cache_file
-                    )
-                except Exception as e:
-                    logger.error(f"💥 Błąd podczas generowania wideo: {e}")
-            else:
-                for idx, klucz in enumerate(lista_kluczy):
-                    logger.info(f"🔑 Próba generowania wideo z kluczem {idx + 1}/{len(lista_kluczy)}...")
-                    os.environ["HF_TOKEN"] = klucz
-                    try:
-                        final_video_cache, used_seed = await generate_ai_video(
-                            sceny_prompts, output_cache_path=temp_cache_file
-                        )
-                        if final_video_cache and Path(final_video_cache).exists():
-                            logger.info(f"✅ Sukces z kluczem {idx + 1}!")
-                            break
-                        else:
-                            logger.warning(f"⚠️ Klucz {idx + 1} nie wygenerował wideo. Próbuję następny...")
-                    except Exception as e:
-                        logger.error(f"💥 Błąd na kluczu {idx + 1}: {e}")
-                        continue
-
-            # 5. Finalize and update sheet
-            if final_video_cache and Path(final_video_cache).exists():
-                shutil.move(final_video_cache, output_path)
-                logger.info(
-                    f"✅ Sukces! Pełny materiał dla ID {task_id} zapisany w: {output_path}"
-                )
-
-                # Cache the video for future use
-                optimizer.cache_video(
-                    prompt=prompt_tekst, duration=2, height=704, width=512,
-                    video_url_or_path=str(output_path), ttl_hours=168
-                )
-
-                sheet.update_cell(i + 2, indeks_status + 1, "Gotowe")
-
-                if indeks_seed is not None:
-                    sheet.update_cell(i + 2, indeks_seed + 1, str(used_seed))
-                    logger.info(
-                        f"💾 Seed {used_seed} został poprawnie zalogowany w arkuszu."
-                    )
-            else:
-                logger.error(
-                    f"❌ Wszystkie klucze wyczerpane lub błąd generowania wideo dla zadania {task_id}!"
-                )
-                sheet.update_cell(i + 2, indeks_status + 1, "Błąd - Limit API")
+    # Log metrics
+    metrics = optimizer.get_metrics()
+    logger.info(
+        f"📊 Statystyki: Oszczędzono ${metrics['cost_saved_usd']:.2f} | "
+        f"Hit rate: {metrics['hit_rate_percent']:.1f}% | "
+        f"Zadań przetworzonych: {tasks_processed}"
+    )
 
 
 def run_bot_loop():
-    """Main bot loop running in background thread."""
+    """
+    Main bot loop running async task processor.
+    """
     try:
         logger.info("🤖 Inicjalizacja automatyzacji bota wideo...")
         arkusz = connect_to_sheet()
         optymalizator = get_optimizer()
+        logger.info("✅ Bot uruchomiony i gotowy do pracy.")
 
+        poll_interval = 300  # 5 minutes
         while True:
             try:
                 # Run async task processor
@@ -211,13 +222,16 @@ def run_bot_loop():
             except Exception as e:
                 logger.error(f"❌ Błąd w cyklu przetwarzania: {e}")
             
-            logger.info("😴 Cykl wjechany czekamy...")
-            time.sleep(300)  # 5-minute interval
+            logger.info(f"😴 Następna weryfikacja za {poll_interval}s...")
+            time.sleep(poll_interval)
 
     except KeyboardInterrupt:
         logger.info("🛑 Zatrzymano bota na żądanie użytkownika.")
     except Exception as e:
         logger.critical(f"💥 Krytyczna awaria głównej pętli bota: {e}")
+    finally:
+        optymalizator.close()
+        logger.info("🔌 Połączenia zamknięte. Bot zatrzymany.")
 
 
 if __name__ == "__main__":
