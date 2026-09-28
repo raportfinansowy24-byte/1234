@@ -178,7 +178,7 @@ choco install ffmpeg
 ```
 
 ### ZeroGPU connection fails
-- Check HF_TOKEN is set: `echo $HF_TOKEN`
+- Check whether HF_TOKEN is set without printing its value: `test -n "$HF_TOKEN" && echo "HF_TOKEN is set" || echo "HF_TOKEN is missing"`
 - Verify token is valid in Hugging Face settings
 - Check internet connection
 
